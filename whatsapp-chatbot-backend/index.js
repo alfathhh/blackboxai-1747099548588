@@ -1,39 +1,47 @@
 "use strict";
 
 require('dotenv').config();
-const { default: makeWASocket, useSingleFileAuthState, DisconnectReason, fetchLatestBaileysVersion, delay } = require("baileys");
-const { Boom } = require("@hapi/boom");
-const { google } = require("googleapis");
 const fs = require("fs");
 const path = require("path");
+const { google } = require("googleapis");
+const { default: makeWASocket, useSingleFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require("baileys");
 
 const { state, saveState } = useSingleFileAuthState('./auth_info.json');
 
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const SHEET_NAME = process.env.SHEET_NAME || "Sheet1";
 
-const SCOPES = ['https://www.googleapis.com/auth/spreadsheets'];
 const TOKEN_PATH = 'token.json';
 const CREDENTIALS_PATH = 'credentials.json';
 
+const INACTIVITY_TIMEOUT = 2 * 60 * 1000; // 2 minutes
+
+// Global variables for Google Sheets API client
 let authClient;
 let sheets;
 
+// Authorize Google API client
 async function authorizeGoogle() {
-    const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH));
-    const { client_secret, client_id, redirect_uris } = credentials.installed || credentials.web;
-    authClient = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
+    try {
+        const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH));
+        const { client_secret, client_id, redirect_uris } = credentials.installed || credentials.web;
+        authClient = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
 
-    if (fs.existsSync(TOKEN_PATH)) {
-        const token = JSON.parse(fs.readFileSync(TOKEN_PATH));
-        authClient.setCredentials(token);
-    } else {
-        console.error("Google API token not found. Please generate token.json");
+        if (fs.existsSync(TOKEN_PATH)) {
+            const token = JSON.parse(fs.readFileSync(TOKEN_PATH));
+            authClient.setCredentials(token);
+        } else {
+            console.error("Google API token not found. Please generate token.json");
+            process.exit(1);
+        }
+        sheets = google.sheets({ version: 'v4', auth: authClient });
+    } catch (error) {
+        console.error("Failed to authorize Google API client:", error);
         process.exit(1);
     }
-    sheets = google.sheets({ version: 'v4', auth: authClient });
 }
 
+// Append chat log to Google Spreadsheet
 async function appendChatLog(timestamp, from, message, senderType) {
     if (!sheets) return;
     const values = [[timestamp, from, message, senderType]];
@@ -50,9 +58,7 @@ async function appendChatLog(timestamp, from, message, senderType) {
     }
 }
 
-// Conversation states per user
-const conversations = new Map();
-
+// Format menu array into numbered string message
 function formatMenu(title, items) {
     let message = `${title}:\n`;
     items.forEach((item, index) => {
@@ -61,6 +67,7 @@ function formatMenu(title, items) {
     return message.trim();
 }
 
+// Menu definitions as arrays
 const MENUS = {
     main: ['Info', 'Chat dengan CS', 'Akhiri percakapan', 'Dummy Menu', 'Produk'],
     info: ['PDRB', 'Kembali ke menu sebelumnya'],
@@ -71,30 +78,231 @@ const MENUS = {
     produk1: ['Detail Produk 1', 'Kembali ke menu sebelumnya']
 };
 
-const INACTIVITY_TIMEOUT = 2 * 60 * 1000; // 2 minutes
+// Conversation states per user
+const conversations = new Map();
 
+// Get current ISO timestamp
 function getCurrentTimestamp() {
     return new Date().toISOString();
 }
 
-function sendMessage(sock, jid, message, isBot = true) {
-    let finalMessage = message;
-    if (isBot) {
-        finalMessage += "\n\nchat digenerate oleh bot";
+// Send message to user, appending bot signature if isBot is true
+async function sendMessage(sock, jid, message, isBot = true) {
+    const finalMessage = isBot ? `${message}\n\nchat digenerate oleh bot` : message;
+    try {
+        await sock.sendMessage(jid, { text: finalMessage });
+    } catch (error) {
+        console.error("Failed to send message:", error);
     }
-    return sock.sendMessage(jid, { text: finalMessage });
 }
 
-function resetInactivityTimeout(jid) {
+// Reset inactivity timeout for a conversation
+function resetInactivityTimeout(sock, jid) {
     const conv = conversations.get(jid);
     if (!conv) return;
     if (conv.timeout) clearTimeout(conv.timeout);
-    conv.timeout = setTimeout(() => {
-        sendMessage(sock, jid, "Percakapan diakhiri karena tidak ada jawaban selama 2 menit.", true);
+    conv.timeout = setTimeout(async () => {
+        await sendMessage(sock, jid, "Percakapan diakhiri karena tidak ada jawaban selama 2 menit.", true);
         conversations.delete(jid);
     }, INACTIVITY_TIMEOUT);
 }
 
+// Handle incoming messages and menu navigation
+async function handleMessage(sock, msg) {
+    if (!msg.message || msg.key.fromMe) return;
+
+    const jid = msg.key.remoteJid;
+    const messageText = msg.message.conversation || (msg.message.extendedTextMessage && msg.message.extendedTextMessage.text) || "";
+
+    // Log user message
+    await appendChatLog(getCurrentTimestamp(), jid, messageText, 'user');
+
+    // Initialize conversation if new user
+    if (!conversations.has(jid)) {
+        conversations.set(jid, {
+            state: 'main',
+            csActive: false,
+            timeout: null,
+        });
+        await sendMessage(sock, jid, `Halo! Selamat datang.\n${formatMenu('Menu', MENUS.main)}`);
+        resetInactivityTimeout(sock, jid);
+        return;
+    }
+
+    const conv = conversations.get(jid);
+
+    // Handle customer service active state
+    if (conv.csActive) {
+        if (messageText.toLowerCase() === "terima kasih") {
+            conv.csActive = false;
+            conv.state = 'main';
+            await sendMessage(sock, jid, "Percakapan kembali diambil alih oleh bot.");
+            resetInactivityTimeout(sock, jid);
+            return;
+        } else {
+            // Simulate forwarding message to CS or user
+            resetInactivityTimeout(sock, jid);
+            return;
+        }
+    }
+
+    // Menu navigation logic
+    switch (conv.state) {
+        case 'main':
+            await handleMainMenu(sock, jid, messageText, conv);
+            break;
+        case 'info':
+            await handleInfoMenu(sock, jid, messageText, conv);
+            break;
+        case 'pdrb':
+            await handlePdrbMenu(sock, jid, messageText, conv);
+            break;
+        case 'dummyMenu':
+            await handleDummyMenu(sock, jid, messageText, conv);
+            break;
+        case 'dummySubmenu1':
+            await handleDummySubmenu1(sock, jid, messageText, conv);
+            break;
+        case 'produk':
+            await handleProdukMenu(sock, jid, messageText, conv);
+            break;
+        case 'produk1':
+            await handleProduk1Menu(sock, jid, messageText, conv);
+            break;
+        default:
+            conv.state = 'main';
+            await sendMessage(sock, jid, formatMenu('Menu', MENUS.main));
+            resetInactivityTimeout(sock, jid);
+            break;
+    }
+}
+
+// Handlers for each menu state
+async function handleMainMenu(sock, jid, messageText, conv) {
+    switch (messageText) {
+        case '1':
+            conv.state = 'info';
+            await sendMessage(sock, jid, formatMenu('Menu Info', MENUS.info));
+            break;
+        case '2':
+            conv.csActive = true;
+            await sendMessage(sock, jid, "mohon tunggu sebentar.");
+            break;
+        case '3':
+            await sendMessage(sock, jid, "Percakapan diakhiri. Terima kasih.");
+            conversations.delete(jid);
+            break;
+        case '4':
+            conv.state = 'dummyMenu';
+            await sendMessage(sock, jid, formatMenu('Dummy Menu', MENUS.dummyMenu));
+            break;
+        case '5':
+            conv.state = 'produk';
+            await sendMessage(sock, jid, formatMenu('Produk', MENUS.produk));
+            break;
+        default:
+            await sendMessage(sock, jid, "Pilihan tidak valid. Silakan pilih menu:\n" + formatMenu('Menu', MENUS.main));
+            break;
+    }
+    resetInactivityTimeout(sock, jid);
+}
+
+async function handleInfoMenu(sock, jid, messageText, conv) {
+    switch (messageText) {
+        case '1':
+            conv.state = 'pdrb';
+            await sendMessage(sock, jid, formatMenu('Menu PDRB', MENUS.pdrb));
+            break;
+        case '2':
+            conv.state = 'main';
+            await sendMessage(sock, jid, formatMenu('Menu', MENUS.main));
+            break;
+        default:
+            await sendMessage(sock, jid, "Pilihan tidak valid. Silakan pilih menu:\n" + formatMenu('Menu Info', MENUS.info));
+            break;
+    }
+    resetInactivityTimeout(sock, jid);
+}
+
+async function handlePdrbMenu(sock, jid, messageText, conv) {
+    switch (messageText) {
+        case '1':
+            conv.state = 'info';
+            await sendMessage(sock, jid, formatMenu('Menu Info', MENUS.info));
+            break;
+        default:
+            await sendMessage(sock, jid, "Pilihan tidak valid. Silakan pilih menu:\n" + formatMenu('Menu PDRB', MENUS.pdrb));
+            break;
+    }
+    resetInactivityTimeout(sock, jid);
+}
+
+async function handleDummyMenu(sock, jid, messageText, conv) {
+    switch (messageText) {
+        case '1':
+            conv.state = 'dummySubmenu1';
+            await sendMessage(sock, jid, formatMenu('Dummy Submenu 1', MENUS.dummySubmenu1));
+            break;
+        case '2':
+            conv.state = 'main';
+            await sendMessage(sock, jid, formatMenu('Menu', MENUS.main));
+            break;
+        default:
+            await sendMessage(sock, jid, "Pilihan tidak valid. Silakan pilih menu:\n" + formatMenu('Dummy Menu', MENUS.dummyMenu));
+            break;
+    }
+    resetInactivityTimeout(sock, jid);
+}
+
+async function handleDummySubmenu1(sock, jid, messageText, conv) {
+    switch (messageText) {
+        case '1':
+            conv.state = 'dummyMenu';
+            await sendMessage(sock, jid, formatMenu('Dummy Menu', MENUS.dummyMenu));
+            break;
+        default:
+            await sendMessage(sock, jid, "Pilihan tidak valid. Silakan pilih menu:\n" + formatMenu('Dummy Submenu 1', MENUS.dummySubmenu1));
+            break;
+    }
+    resetInactivityTimeout(sock, jid);
+}
+
+async function handleProdukMenu(sock, jid, messageText, conv) {
+    switch (messageText) {
+        case '1':
+            conv.state = 'produk1';
+            await sendMessage(sock, jid, formatMenu('Detail Produk 1', MENUS.produk1));
+            break;
+        case '2':
+        case '3':
+            // For simplicity, stay in produk menu for Produk 2 and 3
+            await sendMessage(sock, jid, formatMenu('Produk', MENUS.produk));
+            break;
+        case '4':
+            conv.state = 'main';
+            await sendMessage(sock, jid, formatMenu('Menu', MENUS.main));
+            break;
+        default:
+            await sendMessage(sock, jid, "Pilihan tidak valid. Silakan pilih menu:\n" + formatMenu('Produk', MENUS.produk));
+            break;
+    }
+    resetInactivityTimeout(sock, jid);
+}
+
+async function handleProduk1Menu(sock, jid, messageText, conv) {
+    switch (messageText) {
+        case '1':
+            conv.state = 'produk';
+            await sendMessage(sock, jid, formatMenu('Produk', MENUS.produk));
+            break;
+        default:
+            await sendMessage(sock, jid, "Pilihan tidak valid. Silakan pilih menu:\n" + formatMenu('Detail Produk 1', MENUS.produk1));
+            break;
+    }
+    resetInactivityTimeout(sock, jid);
+}
+
+// Start the WhatsApp bot
 async function startBot() {
     await authorizeGoogle();
 
@@ -125,153 +333,7 @@ async function startBot() {
     sock.ev.on('messages.upsert', async (m) => {
         if (!m.messages || m.type !== 'notify') return;
         const msg = m.messages[0];
-        if (!msg.message || msg.key.fromMe) return;
-
-        const jid = msg.key.remoteJid;
-        const fromMe = msg.key.fromMe;
-        const messageText = msg.message.conversation || (msg.message.extendedTextMessage && msg.message.extendedTextMessage.text) || "";
-
-        // Log all messages
-        await appendChatLog(getCurrentTimestamp(), jid, messageText, 'user');
-
-        // Initialize conversation state if not exists
-        if (!conversations.has(jid)) {
-            conversations.set(jid, {
-                state: 'main',
-                csActive: false,
-                timeout: null,
-            });
-            // Send greeting and main menu
-            await sendMessage(sock, jid, "Halo! Selamat datang.\n" + MENUS.main);
-            resetInactivityTimeout(jid);
-            return;
-        }
-
-        const conv = conversations.get(jid);
-
-        // If cs is active, check if message is from cs or user
-        if (conv.csActive) {
-            // If message from user, forward to cs (simulate)
-            // If message from cs, check for "terima kasih" to end cs session
-            if (messageText.toLowerCase() === "terima kasih") {
-                conv.csActive = false;
-                conv.state = 'main';
-                await sendMessage(sock, jid, "Percakapan kembali diambil alih oleh bot.");
-                resetInactivityTimeout(jid);
-                return;
-            } else {
-                // Forward message to cs or user accordingly
-                // For simplicity, just acknowledge
-                resetInactivityTimeout(jid);
-                return;
-            }
-        }
-
-        // If cs not active, handle menu navigation
-        switch (conv.state) {
-            case 'main':
-                if (messageText === '1') {
-                    conv.state = 'info';
-                    await sendMessage(sock, jid, formatMenu('Menu', MENUS.main));
-                } else if (messageText === '2') {
-                    conv.csActive = true;
-                    await sendMessage(sock, jid, "mohon tunggu sebentar.");
-                } else if (messageText === '3') {
-                    await sendMessage(sock, jid, "Percakapan diakhiri. Terima kasih.");
-                    conversations.delete(jid);
-                } else if (messageText === '4') {
-                    conv.state = 'dummyMenu';
-                    await sendMessage(sock, jid, formatMenu('Dummy Menu', MENUS.dummyMenu));
-                } else if (messageText === '5') {
-                    conv.state = 'produk';
-                    await sendMessage(sock, jid, formatMenu('Produk', MENUS.produk));
-                } else {
-                    await sendMessage(sock, jid, "Pilihan tidak valid. Silakan pilih menu:\n" + formatMenu('Menu', MENUS.main));
-                }
-                resetInactivityTimeout(jid);
-                break;
-
-            case 'info':
-                if (messageText === '1') {
-                    conv.state = 'pdrb';
-                    await sendMessage(sock, jid, formatMenu('Menu PDRB', MENUS.pdrb));
-                } else if (messageText === '2') {
-                    conv.state = 'main';
-                    await sendMessage(sock, jid, formatMenu('Menu', MENUS.main));
-                } else {
-                    await sendMessage(sock, jid, "Pilihan tidak valid. Silakan pilih menu:\n" + formatMenu('Menu Info', MENUS.info));
-                }
-                resetInactivityTimeout(jid);
-                break;
-
-            case 'pdrb':
-                if (messageText === '1') {
-                    conv.state = 'info';
-                    await sendMessage(sock, jid, formatMenu('Menu Info', MENUS.info));
-                } else {
-                    await sendMessage(sock, jid, "Pilihan tidak valid. Silakan pilih menu:\n" + formatMenu('Menu PDRB', MENUS.pdrb));
-                }
-                resetInactivityTimeout(jid);
-                break;
-
-            case 'dummyMenu':
-                if (messageText === '1') {
-                    conv.state = 'dummySubmenu1';
-                    await sendMessage(sock, jid, formatMenu('Dummy Submenu 1', MENUS.dummySubmenu1));
-                } else if (messageText === '2') {
-                    conv.state = 'main';
-                    await sendMessage(sock, jid, formatMenu('Menu', MENUS.main));
-                } else {
-                    await sendMessage(sock, jid, "Pilihan tidak valid. Silakan pilih menu:\n" + formatMenu('Dummy Menu', MENUS.dummyMenu));
-                }
-                resetInactivityTimeout(jid);
-                break;
-
-            case 'dummySubmenu1':
-                if (messageText === '1') {
-                    conv.state = 'dummyMenu';
-                    await sendMessage(sock, jid, formatMenu('Dummy Menu', MENUS.dummyMenu));
-                } else {
-                    await sendMessage(sock, jid, "Pilihan tidak valid. Silakan pilih menu:\n" + formatMenu('Dummy Submenu 1', MENUS.dummySubmenu1));
-                }
-                resetInactivityTimeout(jid);
-                break;
-
-            case 'produk':
-                if (messageText === '1') {
-                    conv.state = 'produk1';
-                    await sendMessage(sock, jid, formatMenu('Detail Produk 1', MENUS.produk1));
-                } else if (messageText === '2') {
-                    conv.state = 'produk';
-                    await sendMessage(sock, jid, formatMenu('Produk', MENUS.produk));
-                } else if (messageText === '3') {
-                    conv.state = 'produk';
-                    await sendMessage(sock, jid, formatMenu('Produk', MENUS.produk));
-                } else if (messageText === '4') {
-                    conv.state = 'main';
-                    await sendMessage(sock, jid, formatMenu('Menu', MENUS.main));
-                } else {
-                    await sendMessage(sock, jid, "Pilihan tidak valid. Silakan pilih menu:\n" + formatMenu('Produk', MENUS.produk));
-                }
-                resetInactivityTimeout(jid);
-                break;
-
-            case 'produk1':
-                if (messageText === '1') {
-                    conv.state = 'produk';
-                    await sendMessage(sock, jid, formatMenu('Produk', MENUS.produk));
-                } else {
-                    await sendMessage(sock, jid, "Pilihan tidak valid. Silakan pilih menu:\n" + formatMenu('Detail Produk 1', MENUS.produk1));
-                }
-                resetInactivityTimeout(jid);
-                break;
-
-            default:
-                conv.state = 'main';
-                await sendMessage(sock, jid, formatMenu('Menu', MENUS.main));
-                resetInactivityTimeout(jid);
-                break;
-        }
+        await handleMessage(sock, msg);
     });
 }
 
